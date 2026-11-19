@@ -1,0 +1,22 @@
+[package]
+name = "graticule"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Retained-mode terminal UI engine: damage-tracked cell canvas, Flexbox layout, retained scene graph, and physical TTY host transport"
+keywords = ["tui", "terminal", "canvas", "grid", "tty"]
+categories = ["command-line-interface", "graphics"]
+
+[features]
+default = ["tty"]
+tty = ["dep:graticule-tty"]
+
+[dependencies]
+graticule-canvas = { workspace = true }
+graticule-tty = { workspace = true, optional = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "crates/graticule-canvas",
+    "crates/graticule-tty",
+    "crates/graticule",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/ming2k/graticule"
+
+[workspace.dependencies]
+graticule-canvas = { version = "0.0.1", path = "crates/graticule-canvas" }
+graticule-tty = { version = "0.0.1", path = "crates/graticule-tty" }
+bitflags = "2"
+crossterm = { version = "0.29", default-features = false }
+libc = "0.2"
+signal-hook = "0.3"
+tempfile = "3"
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+
+# Workspace lint baseline (ADR-0001).
+#
+# `unsafe_code` is denied outright across the workspace; the small OS FFI
+# wrappers in `graticule-tty::sys::unix` carry local `#[allow(unsafe_code)]` with
+# explicit safety invariants, and `CompactSymbol` in `graticule-canvas` carries
+# one local `#[allow(unsafe_code)]`.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"

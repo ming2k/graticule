@@ -1,0 +1,27 @@
+[package]
+name = "graticule-canvas"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Retained-mode terminal cell canvas, Flexbox layout solver, and damage-tracked diff engine"
+keywords = ["tui", "terminal", "canvas", "grid", "diff"]
+categories = ["command-line-interface", "graphics"]
+
+[dependencies]
+bitflags = { workspace = true }
+crossterm = { workspace = true, features = ["windows"] }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "diff_cost"
+harness = false
