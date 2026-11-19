@@ -25,7 +25,6 @@ fn render_cycle(
     front: &mut CellGrid,
     bce: Bce,
 ) -> String {
-    crossterm::style::force_color_output(true);
     let cmd = diff::diff(back, damage, front);
     let mut buf = Vec::new();
     {
@@ -242,7 +241,6 @@ fn resize_preserves_content_and_converges() {
 
 #[test]
 fn bce_clear_to_end_uses_clr_eol_only_for_default_bg() {
-    crossterm::style::force_color_output(true);
     let cmd = DrawCmd {
         w: 10,
         h: 1,
@@ -264,7 +262,6 @@ fn bce_clear_to_end_uses_clr_eol_only_for_default_bg() {
 
 #[test]
 fn bce_clear_to_end_falls_back_to_spaces_without_bce() {
-    crossterm::style::force_color_output(true);
     let cmd = DrawCmd {
         w: 10,
         h: 1,
@@ -602,4 +599,153 @@ fn streaming_append_scrolls_history_instead_of_repainting_it() {
         idle.is_empty(),
         "post-scroll frame must be idle, got {idle:?}"
     );
+}
+
+#[test]
+fn combined_sgr_driver_reproduces_exact_cell_styles_across_frames() {
+    // Minimal SGR + CUP interpreter verifying that our zero-alloc combined SGR
+    // encoder preserves exact fg, bg, and modifier bits across style transitions
+    // including attribute drops (`\x1b[0;...m`).
+    struct StyledTerminal {
+        w: u16,
+        h: u16,
+        cur_x: u16,
+        cur_y: u16,
+        active: Style,
+        grid: Vec<(String, Style)>,
+    }
+
+    impl StyledTerminal {
+        fn new(w: u16, h: u16) -> Self {
+            Self {
+                w,
+                h,
+                cur_x: 0,
+                cur_y: 0,
+                active: Style::RESET,
+                grid: vec![(" ".to_string(), Style::RESET); (w as usize) * (h as usize)],
+            }
+        }
+
+        fn apply(&mut self, wire: &str) {
+            let mut chars = wire.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch == '\x1b' && chars.peek() == Some(&'[') {
+                    chars.next();
+                    let mut seq = String::new();
+                    for c in chars.by_ref() {
+                        seq.push(c);
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                    self.apply_csi(&seq);
+                } else if !ch.is_control() {
+                    if self.cur_x < self.w && self.cur_y < self.h {
+                        let idx = self.cur_y as usize * self.w as usize + self.cur_x as usize;
+                        self.grid[idx] = (ch.to_string(), self.active);
+                    }
+                    self.cur_x = self.cur_x.saturating_add(1);
+                }
+            }
+        }
+
+        fn apply_csi(&mut self, seq: &str) {
+            if let Some(body) = seq.strip_suffix('H') {
+                let mut parts = body.split(';');
+                let row = parts
+                    .next()
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+                let col = parts
+                    .next()
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+                self.cur_y = row.min(self.h.saturating_sub(1));
+                self.cur_x = col.min(self.w.saturating_sub(1));
+            } else if let Some(body) = seq.strip_suffix('m') {
+                let nums: Vec<u8> = if body.is_empty() {
+                    vec![0]
+                } else {
+                    body.split(';').filter_map(|p| p.parse().ok()).collect()
+                };
+                let mut i = 0;
+                while i < nums.len() {
+                    match nums[i] {
+                        0 => self.active = Style::RESET,
+                        1 => self.active.add.insert(Modifier::BOLD),
+                        2 => self.active.add.insert(Modifier::DIM),
+                        3 => self.active.add.insert(Modifier::ITALIC),
+                        4 => self.active.add.insert(Modifier::UNDERLINE),
+                        7 => self.active.add.insert(Modifier::REVERSE),
+                        9 => self.active.add.insert(Modifier::STRIKETHROUGH),
+                        31 => self.active.fg = Color::Red,
+                        32 => self.active.fg = Color::Green,
+                        39 => self.active.fg = Color::Reset,
+                        49 => self.active.bg = Color::Reset,
+                        38 if nums.get(i + 1) == Some(&2) && i + 4 < nums.len() => {
+                            self.active.fg = Color::Rgb(nums[i + 2], nums[i + 3], nums[i + 4]);
+                            i += 4;
+                        }
+                        48 if nums.get(i + 1) == Some(&5) && i + 2 < nums.len() => {
+                            self.active.bg = Color::Indexed(nums[i + 2]);
+                            i += 2;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    let (w, h) = (12, 2);
+    let mut back = CellGrid::new(w, h);
+    let mut damage = Damage::new(h);
+    let mut front = CellGrid::new(w, h);
+    let mut model = StyledTerminal::new(w, h);
+
+    let s_bold_rgb = Style::default()
+        .fg(Color::Rgb(12, 34, 56))
+        .bg(Color::Indexed(236))
+        .add_modifier(Modifier::BOLD | Modifier::ITALIC);
+    let s_drop_italic = Style::default()
+        .fg(Color::Rgb(12, 34, 56))
+        .bg(Color::Indexed(236))
+        .add_modifier(Modifier::BOLD);
+    let s_ansi_green = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::UNDERLINE);
+
+    back.put(&mut damage, 0, 0, Fit::Clip, s_bold_rgb, "AAA");
+    back.put(&mut damage, 3, 0, Fit::Clip, s_drop_italic, "BBB");
+    back.put(&mut damage, 6, 0, Fit::Clip, s_ansi_green, "CCC");
+
+    let mut be = Backend::new(Vec::new())
+        .with_bce(Bce::No)
+        .with_profile(TerminalProfile::direct_color());
+
+    let cmd1 = diff::diff(&back, &damage, &front);
+    be.render(&cmd1).unwrap();
+    diff::promote(&back, &mut damage, &mut front);
+    let frame1 = String::from_utf8(std::mem::take(be.writer())).unwrap();
+    model.apply(&frame1);
+
+    // Frame 2: overwrite middle run with plain Reset style on the SAME backend
+    // so multi-frame SGR state tracking (dropping UNDERLINE + changing fg) is exercised.
+    back.put(&mut damage, 3, 0, Fit::Clip, Style::RESET, "ddd");
+    let cmd2 = diff::diff(&back, &damage, &front);
+    be.render(&cmd2).unwrap();
+    diff::promote(&back, &mut damage, &mut front);
+    let frame2 = String::from_utf8(std::mem::take(be.writer())).unwrap();
+    model.apply(&frame2);
+
+    for x in 0..9u16 {
+        let cell = back.get(x, 0).unwrap();
+        let (sym, style) = &model.grid[x as usize];
+        assert_eq!(sym.as_str(), cell.symbol.as_str(), "col {x} symbol");
+        assert_eq!(*style, cell.style, "col {x} style");
+    }
 }

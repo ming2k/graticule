@@ -72,7 +72,6 @@ fn measure(mut f: impl FnMut() -> usize) -> (Duration, usize) {
 }
 
 fn emit(cmd: &DrawCmd) -> usize {
-    crossterm::style::force_color_output(true);
     let mut buf = Vec::with_capacity(64 * 1024);
     {
         let mut backend = Backend::new(&mut buf)

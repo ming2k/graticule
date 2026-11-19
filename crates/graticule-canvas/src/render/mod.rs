@@ -23,7 +23,7 @@ pub mod paint;
 pub mod profile;
 
 pub use diff::{Draw, DrawCmd, diff, promote, promote_scrolled};
-pub use driver::{Driver, EscapeEmitter, Palette, iter_attrs, to_ct_color};
+pub use driver::{Driver, EscapeEmitter, Palette, to_sgr_color};
 pub use paint::{Paint, Widget};
 pub use profile::{
     CharsetStandard, ColorStandard, TerminalProfile, quantize_to_ansi16, quantize_to_indexed256,

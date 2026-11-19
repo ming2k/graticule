@@ -1,34 +1,51 @@
-//! Graticule: retained-mode terminal UI engine and physical TTY host transport.
+//! Graticule: pure-native retained-mode terminal UI engine and OS TTY transport.
 //!
-//! Combines two cleanly separated layers under one cohesive entry point:
+//! Combines three cleanly separated layers under one cohesive entry point with
+//! zero third-party terminal wrapper dependencies:
 //!
-//! - [`graticule_canvas`]: pure-memory cell grid, damage tracking, Flexbox layout,
-//!   differential escape emitter, widgets, and retained `ui` scene graph.
-//!   Always available; disables all OS session/tty dependencies when built
-//!   with `default-features = false`.
-//! - [`tty`] (enabled by the default `tty` feature): incremental, timeout-aware
-//!   VT input parser, [`Event`] model, [`MouseMode`], [`InputReader`], and
-//!   opt-in [`TerminalSession`] guard.
+//! - [`vt`] (`graticule-vt`): pure-Rust VT / ECMA-48 / DEC / xterm / Kitty wire
+//!   protocol — zero-allocation outbound escape encoding ([`vt::csi`],
+//!   [`vt::sgr`], [`vt::osc`], [`vt::mouse`]) and incremental inbound
+//!   [`VtParser`] + [`Event`] model. Zero OS dependencies.
+//! - [`graticule_canvas`] (re-exported at root): pure-memory cell grid, damage
+//!   tracking, Flexbox layout, differential escape emitter, widgets, and
+//!   retained `ui` scene graph. Zero OS dependencies; compiles cleanly with
+//!   `default-features = false`.
+//! - [`tty`] (`graticule-tty`, enabled by default `tty` feature): pure-native
+//!   OS TTY host transport (`termios` / `TIOCGWINSZ` / `poll(2)` / `SIGWINCH`
+//!   on Unix; Win32 Console API on Windows) providing [`TerminalSession`],
+//!   [`InputReader`], [`ProbeHandle`], [`terminal_size`], and [`is_tty`].
 
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
 pub use graticule_canvas::*;
+pub use graticule_vt as vt;
 
 #[cfg(feature = "tty")]
 pub use graticule_tty as tty;
 
-#[cfg(feature = "tty")]
-pub use graticule_tty::event;
+pub use graticule_vt::{
+    DEFAULT_ESC_TIMEOUT, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    MAX_PASTE_BYTES, MAX_SEQUENCE_BYTES, MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent,
+    MouseEventKind, MouseMode, ParsedItem, SgrColor, SgrEncoder, VtParser, event,
+};
 
 #[cfg(feature = "tty")]
 pub use graticule_tty::{
-    DEFAULT_ESC_TIMEOUT, Event, InputReader, KeyCode, KeyEvent, KeyEventKind, KeyEventState,
-    KeyModifiers, KeyboardProbe, MAX_PASTE_BYTES, MAX_SEQUENCE_BYTES, MediaKeyCode,
-    ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind, MouseMode, ParsedItem, ProbeHandle,
-    SessionConfig, TerminalSession, VtParser, push_disambiguate_escape_codes, rearm_active_mouse,
+    InputReader, KeyboardProbe, ProbeHandle, SessionConfig, TerminalSession, install_panic_hook,
+    is_raw_mode_enabled, is_tty, push_disambiguate_escape_codes, rearm_active_mouse,
     restore_global, terminal_size,
 };
+
+#[cfg(feature = "tty")]
+/// Construct a live [`Terminal`] whose viewport automatically tracks the host
+/// TTY via [`terminal_size`] (falling back to `80x24` when detached).
+pub fn live_terminal<W: std::io::Write, E: EscapeEmitter>(
+    backend: Backend<W, E>,
+) -> Terminal<W, E> {
+    Terminal::with_size_query(backend, terminal_size)
+}
 
 #[cfg(feature = "tty")]
 /// Derive a [`SessionConfig`] aligned with a detected [`TerminalProfile`].

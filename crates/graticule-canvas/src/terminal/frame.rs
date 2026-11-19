@@ -14,12 +14,12 @@
 //! run ahead of the physical terminal**. An idle frame (clean damage, unchanged
 //! cursor) emits zero bytes.
 //!
-//! Raw mode and the alternate screen are the application's responsibility; the
-//! engine exposes [`Terminal::writer`] for exactly that.
+//! Raw mode, alternate screen, and OS TTY size queries are deliberately outside
+//! this pure-memory crate: construct a fixed-size terminal with
+//! [`Terminal::with_size`], or attach a live OS query via
+//! [`Terminal::with_size_query`] (or `graticule::live_terminal`).
 
 use std::io::{self, Write};
-
-use crossterm::QueueableCommand;
 
 use crate::buffer::grid::{CellGrid, Damage};
 use crate::buffer::{Cell, Style};
@@ -125,9 +125,16 @@ impl<'a> Frame<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SizeSource {
+    Fixed,
+    Query(fn() -> io::Result<(u16, u16)>),
+}
+
 /// Owns the backend and the retained state for one render loop.
 pub struct Terminal<W: Write, E: EscapeEmitter = Driver> {
     backend: Backend<W, E>,
+    size_source: SizeSource,
     /// Desired state.
     back: CellGrid,
     /// What the terminal currently shows.
@@ -146,11 +153,32 @@ pub struct Terminal<W: Write, E: EscapeEmitter = Driver> {
 }
 
 impl<W: Write, E: EscapeEmitter> Terminal<W, E> {
-    /// Create a terminal over a backend, sized from the live terminal.
-    pub fn new(backend: Backend<W, E>) -> Self {
-        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+    /// Create a pure, deterministic terminal with explicit `(width, height)`.
+    ///
+    /// Performs zero OS syscalls. Call [`Self::resize_to`] whenever the host
+    /// viewport changes (e.g. on `Event::Resize`).
+    pub fn with_size(backend: Backend<W, E>, width: u16, height: u16) -> Self {
         Self {
             backend,
+            size_source: SizeSource::Fixed,
+            back: CellGrid::new(width, height),
+            front: CellGrid::new_uninitialized(width, height),
+            damage: Damage::new(height),
+            cursor: CursorState::Hidden,
+            presented_cursor: None,
+            cursor_anchor: None,
+            pending_clear: false,
+        }
+    }
+
+    /// Create a terminal whose viewport tracks an external size query function
+    /// (typically `graticule_tty::terminal_size`), falling back to `80x24` if
+    /// the initial query fails.
+    pub fn with_size_query(backend: Backend<W, E>, query: fn() -> io::Result<(u16, u16)>) -> Self {
+        let (w, h) = query().unwrap_or((80, 24));
+        Self {
+            backend,
+            size_source: SizeSource::Query(query),
             back: CellGrid::new(w, h),
             front: CellGrid::new_uninitialized(w, h),
             damage: Damage::new(h),
@@ -205,9 +233,9 @@ impl<W: Write, E: EscapeEmitter> Terminal<W, E> {
     where
         F: FnOnce(&mut Frame<'_>),
     {
-        // Sync the grid size with the terminal. This is the frame loop's single
-        // size query; `Self::size` reports what was last observed.
-        if let Ok((w, h)) = crossterm::terminal::size()
+        // Sync the grid size with the configured size query, if any.
+        if let SizeSource::Query(query) = self.size_source
+            && let Ok((w, h)) = query()
             && self.back.size() != (w, h)
         {
             self.resize_to(w, h);
@@ -281,12 +309,7 @@ impl<W: Write, E: EscapeEmitter> Terminal<W, E> {
         if self.pending_clear {
             // A resize (or a recovered failed write) leaves unknown content
             // behind: home and clear, then repaint the whole grid.
-            self.backend
-                .writer()
-                .queue(crossterm::cursor::MoveTo(0, 0))?;
-            self.backend.writer().queue(crossterm::terminal::Clear(
-                crossterm::terminal::ClearType::All,
-            ))?;
+            self.backend.clear_screen()?;
         }
 
         // Every cell write moves the physical cursor, so the draw commands must
@@ -439,7 +462,6 @@ mod tests {
 
     /// A profile-independent backend: truecolor, no BCE, no env reads.
     fn headless() -> Backend<Vec<u8>, Driver> {
-        crossterm::style::force_color_output(true);
         Backend::new(Vec::new())
             .with_bce(Bce::No)
             .with_profile(crate::render::profile::TerminalProfile::direct_color())
@@ -471,7 +493,7 @@ mod tests {
 
     #[test]
     fn staged_frame_emits_only_the_final_committed_grid() {
-        let mut terminal = Terminal::new(headless());
+        let mut terminal = Terminal::with_size(headless(), 80, 24);
         terminal
             .stage(|frame| {
                 frame.put(0, 0, Style::default(), "intermediate");
@@ -494,7 +516,7 @@ mod tests {
 
     #[test]
     fn identical_frame_emits_no_envelope_or_cursor_bytes() {
-        let mut terminal = Terminal::new(headless());
+        let mut terminal = Terminal::with_size(headless(), 80, 24);
         let paint = |frame: &mut Frame<'_>| {
             frame.put(0, 0, Style::default(), "same");
             frame.set_cursor_position((4, 0));
@@ -511,7 +533,7 @@ mod tests {
 
     #[test]
     fn incremental_frame_positions_caret_before_showing_it() {
-        let mut terminal = Terminal::new(headless());
+        let mut terminal = Terminal::with_size(headless(), 80, 24);
         terminal
             .draw(|frame| {
                 frame.put(0, 0, Style::default(), "A");
@@ -519,13 +541,9 @@ mod tests {
             })
             .unwrap();
         let rendered = String::from_utf8(terminal.writer().clone()).unwrap();
-        let a_idx = rendered.find('A').expect("cell write: {rendered:?}");
-        let move_idx = rendered
-            .find("\x1b[2;3H")
-            .expect("caret move: {rendered:?}");
-        let show_idx = rendered
-            .find("\x1b[?25h")
-            .expect("caret reveal: {rendered:?}");
+        let a_idx = rendered.find('A').expect("cell write");
+        let move_idx = rendered.find("\x1b[2;3H").expect("caret move");
+        let show_idx = rendered.find("\x1b[?25h").expect("caret reveal");
         assert!(
             a_idx < move_idx,
             "draw commands must be emitted before the caret is moved/revealed: {rendered:?}"
@@ -538,7 +556,7 @@ mod tests {
 
     #[test]
     fn cursor_only_frame_moves_without_visibility_toggle() {
-        let mut terminal = Terminal::new(headless());
+        let mut terminal = Terminal::with_size(headless(), 80, 24);
         terminal
             .draw(|frame| {
                 frame.put(0, 0, Style::default(), "A");
@@ -553,13 +571,12 @@ mod tests {
                 frame.set_cursor_position((2, 2));
             })
             .unwrap();
-        // Same cells, same caret: nothing at all, not even a visibility toggle.
         assert!(terminal.writer().is_empty());
     }
 
     #[test]
     fn hidden_frame_parks_at_last_visible_input_anchor() {
-        let mut terminal = Terminal::new(headless());
+        let mut terminal = Terminal::with_size(headless(), 80, 24);
         terminal
             .draw(|frame| {
                 frame.put(0, 0, Style::default(), "A");
@@ -572,10 +589,8 @@ mod tests {
             .draw(|frame| frame.put(0, 0, Style::default(), "B"))
             .unwrap();
         let rendered = String::from_utf8(terminal.writer().clone()).unwrap();
-        // The desired position was (5,5); the anchor is parked there, and the
-        // cursor was already hidden so no reveal is emitted.
         assert!(
-            rendered.contains("\x1b[5;6H") || rendered.contains("\x1b[6;6H"),
+            rendered.contains("\x1b[6;6H"),
             "hidden cursor returns to the stable input anchor: {rendered:?}"
         );
         assert!(
@@ -597,7 +612,7 @@ mod tests {
         let backend = Backend::new(FailOnByteWriter::default())
             .with_bce(Bce::No)
             .with_profile(crate::render::profile::TerminalProfile::direct_color());
-        let mut terminal = Terminal::new(backend);
+        let mut terminal = Terminal::with_size(backend, 80, 24);
         terminal
             .draw(|frame| {
                 frame.put(0, 0, Style::default(), "A");
@@ -617,8 +632,6 @@ mod tests {
             "the injected write failure must surface"
         );
 
-        // The envelope was closed even though the payload failed, and the damage
-        // was marked wholesale so the recovery frame repaints everything.
         let rendered = String::from_utf8(terminal.writer().bytes.clone()).unwrap();
         assert!(
             !rendered.contains("\x1b[?2026h") || rendered.contains("\x1b[?2026l"),
@@ -626,6 +639,20 @@ mod tests {
         );
         assert!(terminal.damage().is_dirty());
         assert!(terminal.damage().rows().is_some());
+    }
+
+    #[test]
+    fn size_query_updates_viewport_on_draw() {
+        fn fixed_query() -> io::Result<(u16, u16)> {
+            Ok((42, 13))
+        }
+        let mut terminal = Terminal::with_size_query(headless(), fixed_query);
+        assert_eq!(terminal.size(), (42, 13));
+        terminal
+            .draw(|frame| {
+                assert_eq!(frame.area(), Rect::new(0, 0, 42, 13));
+            })
+            .unwrap();
     }
 
     #[test]
@@ -645,8 +672,6 @@ mod tests {
         let mut terminal = TestTerminal::new(10, 3);
         terminal.draw(|frame| {
             frame.paint(Rect::new(2, 1, 3, 1), |paint| {
-                // A painter that ignores where it was pointed still cannot
-                // leave its allocation...
                 paint.put(
                     0,
                     0,
@@ -654,7 +679,6 @@ mod tests {
                     Style::default(),
                     "leak",
                 );
-                // ...while an in-area write lands.
                 paint.put(
                     2,
                     1,
@@ -664,11 +688,9 @@ mod tests {
                 );
             });
         });
-        // The 6-column "inside" is clipped to the 3-column allocation.
         assert_eq!(terminal.buffer().get(2, 1).unwrap().symbol, "i");
         assert_eq!(terminal.buffer().get(4, 1).unwrap().symbol, "s");
         assert_eq!(terminal.buffer().get(5, 1).unwrap().symbol, " ");
-        // Neither the leak nor the row above it was touched.
         assert_eq!(terminal.buffer().get(0, 0).unwrap().symbol, " ");
         assert_eq!(terminal.buffer().get(1, 1).unwrap().symbol, " ");
     }
@@ -690,11 +712,7 @@ mod tests {
     fn size_reports_the_observed_grid_without_querying_the_terminal() {
         let terminal = TestTerminal::new(7, 4);
         assert_eq!(terminal.buffer().size(), (7, 4));
-        // `Terminal::size` must not perform I/O: it reports what the last frame
-        // observed. A zero-sized grid reports zeros rather than a bogus pair.
-        let backend = headless();
-        let t = Terminal::new(backend);
-        let (w, h) = t.size();
-        assert_eq!((w, h), t.back.size());
+        let t = Terminal::with_size(headless(), 64, 20);
+        assert_eq!(t.size(), (64, 20));
     }
 }

@@ -1,8 +1,9 @@
 //! A retained-mode terminal canvas and differential rendering engine.
 //!
 //! The engine knows only about cells, styles, grids, layout and terminal
-//! capabilities. It carries no application vocabulary, so it is independently
-//! testable (feed two grids, assert the delta) and reusable.
+//! capabilities. It carries no application vocabulary and zero OS dependencies,
+//! so it is independently testable (feed two grids, assert the delta) and
+//! reusable across native terminals, SSH/PTY servers, and WebAssembly hosts.
 //!
 //! # The model in one paragraph
 //!
@@ -11,9 +12,9 @@
 //! nothing rescans the frame; [`render::diff::diff`] compares the back grid
 //! against the front grid (what the terminal currently shows) and emits a
 //! run-length packed command stream; [`terminal::Backend`] turns those commands
-//! into the minimal escape-code delta; and the changed cells are promoted into
-//! the front grid **only after the bytes have been flushed**, so the retained
-//! model can never run ahead of the physical terminal.
+//! into the minimal escape-code delta via `graticule-vt`; and the changed cells
+//! are promoted into the front grid **only after the bytes have been flushed**,
+//! so the retained model can never run ahead of the physical terminal.
 //!
 //! Wide (CJK) glyphs own their trailing column — the writer fills it with the
 //! head's background — so no terminal or multiplexer can ghost it.
@@ -34,9 +35,9 @@
 //! - [`layout`]: geometry, the one flexbox solver, and anchored positioning.
 //! - [`render`]: the pure differ, the paint context and `Widget` contract,
 //!   escape emission, and terminal capability profiles.
-//! - [`terminal`]: the escape-emitting backend and the draw/commit loop. Raw
-//!   mode and the alternate screen are managed explicitly by `graticule-tty` or
-//!   the caller ([`Terminal::writer`]).
+//! - [`terminal`]: the pure escape-emitting backend and the draw/commit loop.
+//!   Raw mode and the alternate screen are managed explicitly by `graticule-tty`
+//!   or the caller ([`Terminal::writer`]).
 //! - [`widgets`]: declarative primitives and containers.
 //! - [`ui`]: the retained scene graph and component runtime, for applications
 //!   that want identity, local state, focus and input barriers.
@@ -71,12 +72,13 @@ pub use crate::layout::{
 // Render primitives
 pub use crate::render::{
     CharsetStandard, ColorStandard, Draw, DrawCmd, Driver, EscapeEmitter, Paint, Palette,
-    TerminalProfile, Widget, iter_attrs, promote, promote_scrolled, quantize_to_ansi16,
-    quantize_to_indexed256, to_ct_color,
+    TerminalProfile, Widget, promote, promote_scrolled, quantize_to_ansi16, quantize_to_indexed256,
+    to_sgr_color,
 };
 
 // Terminal primitives
 pub use crate::terminal::{Backend, Bce, CursorState, Frame, Terminal, TestTerminal};
+pub use graticule_vt::CursorStyle;
 
 // Widget primitives
 pub use crate::widgets::{

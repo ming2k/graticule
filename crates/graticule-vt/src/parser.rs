@@ -1284,4 +1284,73 @@ mod tests {
             Event::Paste("0123456789abcdef".to_string())
         );
     }
+
+    #[test]
+    fn adversarial_byte_streams_never_panic_and_always_recover_for_sentinel() {
+        // Deterministic xorshift64 stream biased toward escape, CSI, UTF-8 lead,
+        // and control bytes so every state transition is exercised across chunk sizes.
+        let mut seed = 0x5EED_CAFE_1234_5678u64;
+        let mut next_u8 = || -> u8 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let raw = (seed & 0xff) as u8;
+            match raw % 12 {
+                0 => b'\x1b',
+                1 => b'[',
+                2 => b'O',
+                3 => b';',
+                4 => b'?',
+                5 => b'<',
+                6 => b'~',
+                7 => b'M',
+                8 => b'u',
+                _ => raw,
+            }
+        };
+
+        let noise: Vec<u8> = (0..4096).map(|_| next_u8()).collect();
+        let sentinel = b"\x1b[201~\x1b[<35;10;20Mok";
+
+        for chunk_size in [1usize, 2, 3, 7, 19] {
+            let mut parser = VtParser::new().with_max_paste_bytes(128);
+            let mut now = Instant::now();
+            let mut out = Vec::new();
+
+            for chunk in noise.chunks(chunk_size) {
+                parser.feed(chunk, now, &mut out);
+                now += Duration::from_millis(5);
+                parser.flush_timeout(now, &mut out);
+                out.clear();
+            }
+
+            // Flush any dangling state with a timeout + ESC reset boundary, then feed sentinel.
+            now += DEFAULT_ESC_TIMEOUT;
+            parser.flush_timeout(now, &mut out);
+            // Terminate any dangling CSI/X10/paste state cleanly and verify recovery.
+            parser.reset();
+            out.clear();
+
+            for chunk in sentinel.chunks(chunk_size) {
+                parser.feed(chunk, now, &mut out);
+            }
+            let events = events_from(out);
+            assert!(
+                events.contains(&Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 9,
+                    row: 19,
+                    modifiers: KeyModifiers::NONE,
+                })),
+                "chunk_size={chunk_size} failed to decode mouse sentinel: {events:?}"
+            );
+            assert!(
+                events.ends_with(&[
+                    Event::Key(KeyCode::Char('o').into()),
+                    Event::Key(KeyCode::Char('k').into()),
+                ]),
+                "chunk_size={chunk_size} failed to decode trailing keys: {events:?}"
+            );
+        }
+    }
 }

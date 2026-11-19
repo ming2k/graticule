@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::event::Event;
+use graticule_vt::csi::PROBE_KITTY_AND_DA1;
+use graticule_vt::event::Event;
+
 use crate::sys;
 
 /// Shared synchronization state between [`InputReader`] and the off-frame
@@ -51,6 +53,7 @@ impl KeyboardProbe {
         }
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn reset(&self) {
         if let Ok(mut guard) = self.state.lock() {
             guard.supported = None;
@@ -58,11 +61,12 @@ impl KeyboardProbe {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn wait_for_test(&self, timeout: Duration) -> bool {
         self.wait(timeout)
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn wait(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let Ok(mut guard) = self.state.lock() else {
@@ -106,7 +110,7 @@ impl ProbeHandle {
             {
                 self.probe.reset();
                 let mut stdout = io::stdout();
-                if stdout.write_all(b"\x1b[?u\x1b[c").is_err() || stdout.flush().is_err() {
+                if stdout.write_all(PROBE_KITTY_AND_DA1).is_err() || stdout.flush().is_err() {
                     return false;
                 }
                 self.probe.wait(timeout)
@@ -115,6 +119,7 @@ impl ProbeHandle {
             {
                 let _ = timeout;
                 let _ = &self.probe;
+                let _ = PROBE_KITTY_AND_DA1;
                 sys::probe_keyboard_enhancement_sync()
             }
         })
@@ -122,13 +127,15 @@ impl ProbeHandle {
 }
 
 /// Handle owning the dedicated TTY reader thread. Dropping it wakes and stops
-/// the background thread cleanly.
+/// the background thread cleanly with zero polling delay.
 pub struct InputReader {
     shutdown: Arc<AtomicBool>,
     probe: Arc<KeyboardProbe>,
     cached_kitty_support: Arc<OnceLock<bool>>,
     #[cfg(unix)]
     wake_tx: Option<std::os::unix::net::UnixStream>,
+    #[cfg(windows)]
+    wake: Arc<sys::WakeHandle>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -140,6 +147,8 @@ impl Drop for InputReader {
             let _ = tx.write_all(b"q");
             let _ = tx.flush();
         }
+        #[cfg(windows)]
+        self.wake.wake();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -169,6 +178,11 @@ impl InputReader {
         #[cfg(unix)]
         let (wake_rx, wake_tx) = std::os::unix::net::UnixStream::pair()?;
 
+        #[cfg(windows)]
+        let wake = Arc::new(sys::WakeHandle::new()?);
+        #[cfg(windows)]
+        let thread_wake = wake.clone();
+
         let join = std::thread::Builder::new()
             .name("graticule-tty-input".into())
             .spawn(move || {
@@ -177,7 +191,7 @@ impl InputReader {
                 #[cfg(windows)]
                 {
                     let _ = thread_probe;
-                    let _ = sys::run_event_loop(&mut sink, thread_shutdown);
+                    let _ = sys::run_event_loop(&mut sink, thread_shutdown, thread_wake);
                 }
             })?;
 
@@ -187,6 +201,8 @@ impl InputReader {
             cached_kitty_support: Arc::new(OnceLock::new()),
             #[cfg(unix)]
             wake_tx: Some(wake_tx),
+            #[cfg(windows)]
+            wake,
             join: Some(join),
         })
     }

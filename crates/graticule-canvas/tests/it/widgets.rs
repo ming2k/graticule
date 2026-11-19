@@ -160,8 +160,7 @@ fn frame_loop_converges() {
         let backend = Backend::new(&mut buf)
             .with_bce(Bce::Yes)
             .with_profile(TerminalProfile::direct_color());
-        let mut term = Terminal::new(backend);
-        term.resize_to(10, 2);
+        let mut term = Terminal::with_size(backend, 10, 2);
         term.draw(|f| {
             f.render_widget(&mut Paragraph::new(Line::raw("hi")), Rect::new(0, 0, 10, 1));
         })
@@ -189,8 +188,7 @@ fn resize_to_clears_screen_and_homes_cursor_on_commit() {
         let backend = Backend::new(&mut buf)
             .with_bce(Bce::Yes)
             .with_profile(TerminalProfile::direct_color());
-        let mut term = Terminal::new(backend);
-        term.resize_to(20, 5);
+        let mut term = Terminal::with_size(backend, 20, 5);
         term.draw(|f| {
             f.render_widget(
                 &mut Paragraph::new(Line::raw("hello")),
@@ -229,8 +227,7 @@ fn declarative_column_and_row_composition_in_terminal() {
         let backend = Backend::new(&mut buf)
             .with_bce(Bce::Yes)
             .with_profile(TerminalProfile::direct_color());
-        let mut term = Terminal::new(backend);
-        term.resize_to(30, 10);
+        let mut term = Terminal::with_size(backend, 30, 10);
 
         // Build declarative UI tree
         let mut ui = Column::new()

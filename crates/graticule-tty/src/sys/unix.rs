@@ -1,4 +1,5 @@
-//! Unix `poll(2)` + `SIGWINCH` self-pipe TTY reader.
+//! Pure-native Unix TTY driver: `termios` raw mode, `TIOCGWINSZ` viewport
+//! sizing, and `poll(2)` + `SIGWINCH` self-pipe single-reader input loop.
 //!
 //! Never sets `O_NONBLOCK` on `STDIN_FILENO` (which shares an open file
 //! description with `stdout`/`stderr` on most PTYs and would cause `stdout`
@@ -9,17 +10,29 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
+use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::event::Event;
-use crate::parser::{ParsedItem, VtParser};
+use graticule_vt::event::Event;
+use graticule_vt::parser::{ParsedItem, VtParser};
+
 use crate::reader::KeyboardProbe;
 
 const READ_BUF_SIZE: usize = 4096;
+
+struct SavedTermios {
+    orig: libc::termios,
+    fd: RawFd,
+    /// Keeps `/dev/tty` open until raw mode is disabled when `STDIN_FILENO` is
+    /// not a TTY.
+    _owned_tty: Option<File>,
+}
+
+static SAVED_TERMIOS: Mutex<Option<SavedTermios>> = Mutex::new(None);
 
 enum TtySource {
     BorrowedFd(RawFd),
@@ -28,9 +41,7 @@ enum TtySource {
 
 impl TtySource {
     fn open() -> io::Result<Self> {
-        // SAFETY: `isatty` takes an integer fd with no pointer dereference.
-        let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
-        if stdin_is_tty {
+        if fd_is_tty(libc::STDIN_FILENO) {
             Ok(Self::BorrowedFd(libc::STDIN_FILENO))
         } else {
             let file = OpenOptions::new().read(true).open("/dev/tty")?;
@@ -63,11 +74,122 @@ impl TtySource {
     }
 }
 
+fn fd_is_tty(fd: RawFd) -> bool {
+    // SAFETY: `isatty` takes an integer fd with no pointer dereference.
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+/// Whether the process is attached to an interactive TTY on stdin or stdout.
+pub(crate) fn is_tty() -> bool {
+    fd_is_tty(libc::STDIN_FILENO) || fd_is_tty(libc::STDOUT_FILENO)
+}
+
+/// Read the current `termios` configuration of `fd`, retrying on `EINTR`.
+fn tcgetattr_retry(fd: RawFd) -> io::Result<libc::termios> {
+    let mut termios = MaybeUninit::<libc::termios>::uninit();
+    loop {
+        // SAFETY: `termios.as_mut_ptr()` is a valid writable `libc::termios`.
+        let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+        if rc == 0 {
+            // SAFETY: `tcgetattr` succeeded and initialized the struct.
+            return Ok(unsafe { termios.assume_init() });
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+/// Apply `termios` immediately (`TCSANOW`), retrying on `EINTR`.
+fn tcsetattr_retry(fd: RawFd, termios: &libc::termios) -> io::Result<()> {
+    loop {
+        // SAFETY: `termios` points to a valid initialized `libc::termios`.
+        let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, termios) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+/// Put a specific TTY descriptor into raw mode, returning the original cooked
+/// `termios` so the caller can restore it bit-for-bit.
+fn enable_raw_mode_on_fd(fd: RawFd) -> io::Result<libc::termios> {
+    let orig = tcgetattr_retry(fd)?;
+    let mut raw = orig;
+    // SAFETY: `raw` is a valid initialized `libc::termios`.
+    unsafe {
+        libc::cfmakeraw(&mut raw);
+    }
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    tcsetattr_retry(fd, &raw)?;
+    Ok(orig)
+}
+
+/// Enable raw mode on `STDIN_FILENO` (or `/dev/tty` if stdin is redirected).
+///
+/// Idempotent: calling while already in raw mode succeeds without overwriting
+/// the saved original cooked `termios`.
+pub(crate) fn enable_raw_mode() -> io::Result<()> {
+    let mut guard = SAVED_TERMIOS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_some() {
+        return Ok(());
+    }
+
+    let (fd, owned_tty) = if fd_is_tty(libc::STDIN_FILENO) {
+        (libc::STDIN_FILENO, None)
+    } else {
+        let file = OpenOptions::new().read(true).open("/dev/tty")?;
+        let raw_fd = file.as_raw_fd();
+        (raw_fd, Some(file))
+    };
+
+    let orig = enable_raw_mode_on_fd(fd)?;
+    *guard = Some(SavedTermios {
+        orig,
+        fd,
+        _owned_tty: owned_tty,
+    });
+    Ok(())
+}
+
+/// Restore the original cooked `termios` saved by [`enable_raw_mode`].
+///
+/// Idempotent: safe to call multiple times or when raw mode is not active.
+pub(crate) fn disable_raw_mode() -> io::Result<()> {
+    let saved = {
+        let mut guard = SAVED_TERMIOS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.take()
+    };
+    if let Some(saved) = saved {
+        tcsetattr_retry(saved.fd, &saved.orig)?;
+    }
+    Ok(())
+}
+
+/// Whether Graticule currently holds the TTY in raw mode.
+pub(crate) fn is_raw_mode_enabled() -> bool {
+    SAVED_TERMIOS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
+}
+
 /// Query terminal dimensions directly via `TIOCGWINSZ`, avoiding any subprocess
 /// fallback (`tput`).
 pub(crate) fn terminal_size() -> io::Result<(u16, u16)> {
-    if let Some(sz) =
-        ioctl_winsize(libc::STDOUT_FILENO).or_else(|| ioctl_winsize(libc::STDIN_FILENO))
+    if let Some(sz) = ioctl_winsize(libc::STDOUT_FILENO)
+        .or_else(|| ioctl_winsize(libc::STDIN_FILENO))
+        .or_else(|| ioctl_winsize(libc::STDERR_FILENO))
     {
         return Ok(sz);
     }
@@ -76,7 +198,10 @@ pub(crate) fn terminal_size() -> io::Result<(u16, u16)> {
     {
         return Ok(sz);
     }
-    crossterm::terminal::size()
+    Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "failed to query terminal dimensions via TIOCGWINSZ",
+    ))
 }
 
 fn ioctl_winsize(fd: RawFd) -> Option<(u16, u16)> {
@@ -289,11 +414,13 @@ fn drain_stream(stream: &mut UnixStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CStr;
     use std::io::Write;
+    use std::os::unix::io::FromRawFd;
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use crate::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
+    use graticule_vt::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 
     struct LoopHarness {
         ev_rx: mpsc::Receiver<Event>,
@@ -398,5 +525,67 @@ mod tests {
         // Closing the write end triggers clean EOF exit without spin.
         drop(tty_tx);
         h.join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn real_pty_termios_raw_mode_roundtrip_and_winsize_ioctl() {
+        // Open a real kernel PTY master/slave pair to exercise actual
+        // `tcgetattr`/`cfmakeraw`/`tcsetattr`/`TIOCGWINSZ` syscalls.
+        let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        if master_fd < 0 {
+            // Skip cleanly only if sandboxed environment blocks /dev/ptmx.
+            return;
+        }
+        // SAFETY: `master_fd` is a freshly opened valid descriptor.
+        let master = unsafe { File::from_raw_fd(master_fd) };
+        assert_eq!(unsafe { libc::grantpt(master.as_raw_fd()) }, 0);
+        assert_eq!(unsafe { libc::unlockpt(master.as_raw_fd()) }, 0);
+
+        let slave_name = unsafe {
+            let ptr = libc::ptsname(master.as_raw_fd());
+            assert!(!ptr.is_null());
+            CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        };
+        let slave = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&slave_name)
+            .unwrap();
+        let slave_fd = slave.as_raw_fd();
+        assert!(fd_is_tty(slave_fd));
+
+        // 1. Verify TIOCSWINSZ -> ioctl_winsize exact dimension roundtrip.
+        let ws = libc::winsize {
+            ws_row: 43,
+            ws_col: 132,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws) },
+            0
+        );
+        assert_eq!(ioctl_winsize(slave_fd), Some((132, 43)));
+
+        // 2. Verify raw mode clears canonical/echo/signal flags and sets VMIN=1, VTIME=0.
+        let before = tcgetattr_retry(slave_fd).unwrap();
+        let saved = enable_raw_mode_on_fd(slave_fd).unwrap();
+        assert_eq!(before.c_lflag, saved.c_lflag);
+
+        let during = tcgetattr_retry(slave_fd).unwrap();
+        assert_eq!(during.c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG), 0);
+        assert_eq!(during.c_iflag & (libc::IXON | libc::ICRNL), 0);
+        assert_eq!(during.c_oflag & libc::OPOST, 0);
+        assert_eq!(during.c_cc[libc::VMIN], 1);
+        assert_eq!(during.c_cc[libc::VTIME], 0);
+
+        // 3. Verify restore returns original termios bit-for-bit.
+        tcsetattr_retry(slave_fd, &saved).unwrap();
+        let after = tcgetattr_retry(slave_fd).unwrap();
+        assert_eq!(after.c_iflag, before.c_iflag);
+        assert_eq!(after.c_oflag, before.c_oflag);
+        assert_eq!(after.c_cflag, before.c_cflag);
+        assert_eq!(after.c_lflag, before.c_lflag);
+        assert_eq!(after.c_cc, before.c_cc);
     }
 }

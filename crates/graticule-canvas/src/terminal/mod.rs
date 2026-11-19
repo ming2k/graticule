@@ -1,9 +1,11 @@
-//! Terminal execution: the crossterm backend, the commit loop, and the headless
+//! Terminal execution: the pure-VT backend, the commit loop, and the headless
 //! test terminal.
 //!
-//! This layer sits *above* `render`: it owns I/O and the draw/commit loop, and it
-//! is the only place `crossterm` appears. Raw mode and the alternate screen are
-//! deliberately not managed here — see `Terminal::writer`.
+//! This layer sits *above* `render`: it encodes [`crate::render::DrawCmd`]s
+//! into minimal VT/ECMA-48 escape sequences via `graticule-vt` and owns the
+//! draw/commit loop. Raw mode, alternate screen, and OS TTY queries are
+//! deliberately managed outside this crate by `graticule-tty` (or injected via
+//! [`Terminal::with_size_query`]).
 
 pub mod backend;
 pub mod frame;

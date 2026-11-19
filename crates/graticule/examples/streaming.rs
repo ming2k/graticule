@@ -8,7 +8,8 @@
 //! screen repaint.
 //!
 //! Notice how [`TerminalSession`] and [`InputReader`] handle raw mode,
-//! alternate screen, and input cleanly with no direct `crossterm` imports.
+//! alternate screen, and input natively with zero third-party terminal wrapper
+//! crates.
 //!
 //! Run with:
 //! ```sh
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 use graticule::widgets::{Block, BorderType, Borders, Line, Paragraph, Span};
 use graticule::{
     Backend, Color, Event, InputReader, KeyCode, KeyModifiers, MouseMode, SessionConfig, Style,
-    Terminal, TerminalSession,
+    TerminalSession, live_terminal,
 };
 
 fn main() -> io::Result<()> {
@@ -35,7 +36,7 @@ fn main() -> io::Result<()> {
 }
 
 fn run_streaming() -> io::Result<()> {
-    let mut terminal = Terminal::new(Backend::new(stdout()));
+    let mut terminal = live_terminal(Backend::new(stdout()));
     let (_reader, rx) = InputReader::spawn_channel()?;
 
     let mut messages: Vec<String> = Vec::new();

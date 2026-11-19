@@ -31,7 +31,7 @@ use graticule::ui::{Component, LayoutBox, NodeLayout, UiRuntime};
 use graticule::widgets::{Block, BorderType, Borders, Line, Paragraph, Span};
 use graticule::{
     Backend, Color, Event, InputReader, KeyCode, MouseMode, Paint, Rect, SessionConfig, Style,
-    Terminal, TerminalSession,
+    TerminalSession, live_terminal,
 };
 
 fn main() -> io::Result<()> {
@@ -46,7 +46,7 @@ fn main() -> io::Result<()> {
 fn run_dialog_app() -> io::Result<()> {
     let out = stdout();
     let is_tty = out.is_terminal();
-    let mut terminal = Terminal::new(Backend::new(out));
+    let mut terminal = live_terminal(Backend::new(out));
     let mut ui = UiRuntime::<&'static str>::default();
     let (_reader, rx) = InputReader::spawn_channel()?;
 

@@ -4,29 +4,24 @@
 //! # Design
 //!
 //! Capability *detection* lives in [`crate::render::profile`]. This module only
-//! turns a requested [`Style`] into the SGR bytes a given palette needs, and
-//! wraps frames in a synchronized-update envelope when the terminal supports one.
+//! turns a requested [`Style`] into the minimal ECMA-48 / ITU-T T.416 SGR bytes
+//! a given palette needs, and wraps frames in a DEC Mode 2026 synchronized-update
+//! envelope when the terminal supports one.
 //!
-//! The four protocol variants this used to be (four structs plus a dispatch
-//! enum, with the SGR delta logic copied three times) are now one struct and one
-//! [`Palette`] discriminant, because the palette is the *only* thing that
-//! differed. Every capability that affects emission is a field here, and every
-//! one of them is honoured:
+//! Every capability that affects emission is a field here, and every one of
+//! them is honoured:
 //!
 //! - `palette` — how colors map onto the terminal (`Monochrome` strips them and
 //!   expresses emphasis through reverse video).
 //! - `italic` — when false, italic maps to underline instead of being emitted.
-//! - `ascii_only` — when true, [`EscapeEmitter::transliterate`] degrades any
-//!   non-ASCII symbol to 7-bit, geometry preserved.
+//! - `charset` — when [`CharsetStandard::Ascii`], [`EscapeEmitter::transliterate`]
+//!   degrades any non-ASCII symbol to 7-bit, geometry preserved.
 
 use std::borrow::Cow;
 use std::io::{self, Write};
 
-use crossterm::{
-    QueueableCommand,
-    style::{Attribute, Color as CtColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
-    terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
-};
+use graticule_vt::csi::{BEGIN_SYNC_UPDATE, END_SYNC_UPDATE};
+use graticule_vt::sgr::{SGR_RESET, SgrColor, SgrEncoder};
 
 use crate::buffer::glyph::to_ascii;
 use crate::buffer::{Color, Modifier, Style};
@@ -80,7 +75,7 @@ impl Palette {
         }
     }
 
-    /// Whether this palette can render achromatic distinction (i.e. is not
+    /// Whether this palette can render chromatic distinction (i.e. is not
     /// monochrome).
     pub const fn supports_color(self) -> bool {
         !matches!(self, Palette::Monochrome)
@@ -109,8 +104,8 @@ pub trait EscapeEmitter {
     }
 }
 
-/// The standard escape emitter: SGR delta emission against a [`Palette`], with
-/// synchronized updates and symbol transliteration.
+/// The standard escape emitter: zero-allocation combined SGR delta emission
+/// against a [`Palette`], with synchronized updates and symbol transliteration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Driver {
     palette: Palette,
@@ -220,7 +215,7 @@ impl Driver {
                 want.bg = self.palette.encode(want.bg);
             }
         }
-        if !self.italic {
+        if !self.italic && want.add.contains(Modifier::ITALIC) {
             want.add.remove(Modifier::ITALIC);
             want.add.insert(Modifier::UNDERLINE);
         }
@@ -235,42 +230,38 @@ impl EscapeEmitter for Driver {
             return Ok(());
         }
         let have = self.style;
-
-        if want.fg != have.fg {
-            out.queue(SetForegroundColor(to_ct_color(want.fg)))?;
-        }
-        if want.bg != have.bg {
-            out.queue(SetBackgroundColor(to_ct_color(want.bg)))?;
-        }
-
-        // SGR 0 clears *everything*, including the colors just set, so a frame
-        // that drops an attribute resets and then re-applies the full style.
         let dropped = have.add - want.add;
-        let added = want.add - have.add;
+        let mut sgr = SgrEncoder::new();
+
         if dropped.is_empty() {
-            for attr in iter_attrs(added) {
-                out.queue(SetAttribute(attr))?;
+            if want.fg != have.fg {
+                sgr.fg(to_sgr_color(want.fg));
             }
+            if want.bg != have.bg {
+                sgr.bg(to_sgr_color(want.bg));
+            }
+            push_modifiers(&mut sgr, want.add - have.add);
         } else {
-            out.queue(SetAttribute(Attribute::Reset))?;
+            // SGR 0 clears everything (compatible all the way down to VT100);
+            // combine the reset and re-applied style into a single sequence.
+            sgr.reset();
             if want.fg != Color::Reset {
-                out.queue(SetForegroundColor(to_ct_color(want.fg)))?;
+                sgr.fg(to_sgr_color(want.fg));
             }
             if want.bg != Color::Reset {
-                out.queue(SetBackgroundColor(to_ct_color(want.bg)))?;
+                sgr.bg(to_sgr_color(want.bg));
             }
-            for attr in iter_attrs(want.add) {
-                out.queue(SetAttribute(attr))?;
-            }
+            push_modifiers(&mut sgr, want.add);
         }
 
+        sgr.finish(out)?;
         self.style = want;
         Ok(())
     }
 
     fn begin_sync<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
         if self.sync {
-            out.queue(BeginSynchronizedUpdate).map(|_| ())
+            out.write_all(BEGIN_SYNC_UPDATE)
         } else {
             Ok(())
         }
@@ -278,13 +269,13 @@ impl EscapeEmitter for Driver {
 
     fn end_sync<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
         if self.sync {
-            out.queue(EndSynchronizedUpdate)?;
+            out.write_all(END_SYNC_UPDATE)?;
         }
         out.flush()
     }
 
     fn invalidate<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
-        out.queue(SetAttribute(Attribute::Reset))?;
+        out.write_all(SGR_RESET)?;
         self.style = Style::RESET;
         Ok(())
     }
@@ -303,54 +294,53 @@ impl EscapeEmitter for Driver {
     }
 }
 
-/// Translate an engine [`Color`] into a crossterm color.
-pub fn to_ct_color(c: Color) -> CtColor {
+/// Map a canvas [`Color`] onto the wire-level [`SgrColor`].
+#[inline]
+pub const fn to_sgr_color(c: Color) -> SgrColor {
     match c {
-        Color::Reset => CtColor::Reset,
-        Color::Rgb(r, g, b) => CtColor::Rgb { r, g, b },
-        Color::Indexed(idx) => CtColor::AnsiValue(idx),
-        Color::Black => CtColor::Black,
-        Color::Red => CtColor::DarkRed,
-        Color::Green => CtColor::DarkGreen,
-        Color::Yellow => CtColor::DarkYellow,
-        Color::Blue => CtColor::DarkBlue,
-        Color::Magenta => CtColor::DarkMagenta,
-        Color::Cyan => CtColor::DarkCyan,
-        Color::Gray => CtColor::Grey,
-        Color::DarkGray => CtColor::DarkGrey,
-        Color::LightRed => CtColor::Red,
-        Color::LightGreen => CtColor::Green,
-        Color::LightYellow => CtColor::Yellow,
-        Color::LightBlue => CtColor::Blue,
-        Color::LightMagenta => CtColor::Magenta,
-        Color::LightCyan => CtColor::Cyan,
-        Color::White => CtColor::White,
+        Color::Reset => SgrColor::Reset,
+        Color::Black => SgrColor::Black,
+        Color::Red => SgrColor::Red,
+        Color::Green => SgrColor::Green,
+        Color::Yellow => SgrColor::Yellow,
+        Color::Blue => SgrColor::Blue,
+        Color::Magenta => SgrColor::Magenta,
+        Color::Cyan => SgrColor::Cyan,
+        Color::Gray => SgrColor::Gray,
+        Color::DarkGray => SgrColor::DarkGray,
+        Color::LightRed => SgrColor::LightRed,
+        Color::LightGreen => SgrColor::LightGreen,
+        Color::LightYellow => SgrColor::LightYellow,
+        Color::LightBlue => SgrColor::LightBlue,
+        Color::LightMagenta => SgrColor::LightMagenta,
+        Color::LightCyan => SgrColor::LightCyan,
+        Color::White => SgrColor::White,
+        Color::Indexed(idx) => SgrColor::Indexed(idx),
+        Color::Rgb(r, g, b) => SgrColor::Rgb(r, g, b),
     }
 }
 
-/// Translate modifier bits into crossterm `Attribute`s in a stable order, so a
-/// given style always emits the same byte sequence.
-pub fn iter_attrs(m: Modifier) -> impl Iterator<Item = Attribute> {
-    let mut v = Vec::new();
+/// Push modifier bits in a deterministic, stable order with zero allocation.
+#[inline]
+fn push_modifiers(sgr: &mut SgrEncoder, m: Modifier) {
     if m.contains(Modifier::BOLD) {
-        v.push(Attribute::Bold);
+        sgr.bold();
     }
     if m.contains(Modifier::DIM) {
-        v.push(Attribute::Dim);
+        sgr.dim();
     }
     if m.contains(Modifier::ITALIC) {
-        v.push(Attribute::Italic);
+        sgr.italic();
     }
     if m.contains(Modifier::UNDERLINE) {
-        v.push(Attribute::Underlined);
+        sgr.underline();
     }
     if m.contains(Modifier::REVERSE) {
-        v.push(Attribute::Reverse);
+        sgr.reverse();
     }
     if m.contains(Modifier::STRIKETHROUGH) {
-        v.push(Attribute::CrossedOut);
+        sgr.strikethrough();
     }
-    v.into_iter()
 }
 
 #[cfg(test)]
@@ -391,7 +381,7 @@ mod tests {
             !out.contains("38;2;"),
             "ansi16 must not emit a 24-bit sequence: {out:?}"
         );
-        assert!(out.contains("38;5;") || out.contains("3"), "{out:?}");
+        assert_eq!(out, "\x1b[31m");
     }
 
     #[test]
@@ -403,38 +393,37 @@ mod tests {
                 .fg(Color::Rgb(1, 2, 3))
                 .bg(Color::Rgb(4, 5, 6)),
         );
-        assert!(!out.contains("38;"), "no fg color code: {out:?}");
-        assert!(!out.contains("48;"), "no bg color code: {out:?}");
-        assert!(out.contains('7'), "emphasis becomes reverse video: {out:?}");
+        assert_eq!(out, "\x1b[7m");
     }
 
     #[test]
-    fn italic_maps_to_underline_when_unsupported() {
-        let style = Style::default().add_modifier(Modifier::ITALIC);
+    fn italic_maps_to_underline_only_when_italic_is_requested() {
+        let italic_style = Style::default().add_modifier(Modifier::ITALIC);
         let mut no_italic = Driver::with_palette(Palette::Ansi16).with_italic(false);
-        let out = emit(&mut no_italic, style);
-        assert!(out.contains('4'), "italic became underline: {out:?}");
-        assert!(!out.contains('3'), "no italic SGR: {out:?}");
+        assert_eq!(emit(&mut no_italic, italic_style), "\x1b[4m");
+
+        // Plain style on a non-italic driver must NOT receive underline.
+        let mut no_italic_plain = Driver::with_palette(Palette::Ansi16).with_italic(false);
+        assert_eq!(
+            emit(&mut no_italic_plain, Style::default().fg(Color::Cyan)),
+            "\x1b[36m"
+        );
 
         let mut italic = Driver::with_palette(Palette::TrueColor).with_italic(true);
-        assert!(emit(&mut italic, style).contains('3'));
+        assert_eq!(emit(&mut italic, italic_style), "\x1b[3m");
     }
 
     #[test]
-    fn dropping_an_attribute_resets_then_reapplies_the_style() {
+    fn dropping_an_attribute_resets_then_reapplies_the_style_in_one_sequence() {
         let mut d = Driver::with_palette(Palette::TrueColor);
-        emit(
-            &mut d,
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        assert_eq!(
+            emit(
+                &mut d,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            "\x1b[31;1m"
         );
-        let out = emit(&mut d, Style::default().fg(Color::Red));
-        assert!(out.starts_with("\x1b[0m"), "reset first: {out:?}");
-        // crossterm emits the named palette as an indexed foreground; what
-        // matters is that a foreground is re-applied after SGR 0 cleared it.
-        assert!(
-            out.contains("m\x1b[38;5;1m") || out.contains("m\x1b[31m"),
-            "fg re-applied after reset: {out:?}"
-        );
+        assert_eq!(emit(&mut d, Style::default().fg(Color::Red)), "\x1b[0;31m");
     }
 
     #[test]

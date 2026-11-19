@@ -1,24 +1,21 @@
-//! The crossterm backend: turn a [`DrawCmd`] into the minimal escape-code delta
-//! on the wire, with BCE (back-color-erase) awareness.
+//! Pure-VT output backend: turns a [`DrawCmd`] into the minimal escape-code
+//! delta on the wire, with BCE (back-color-erase) awareness and atomic
+//! single-write frame coalescing.
 //!
 //! # Responsibilities
 //!
-//! - Track the **current** cursor position and the emitter's style across draws,
-//!   so consecutive runs that share a style emit no SGR and a run already at the
-//!   right position emits no cursor move. This is the cell-level minimization
-//!   vim's TUI frontend does.
+//! - Track the **current** cursor position, cursor visibility, and emitter
+//!   style across draws, so consecutive runs that share a style emit no SGR
+//!   and a run already at the right position emits no cursor move.
 //! - Detect `bce` from `TERM` and, when available, clear a blank tail with
 //!   `clr_eol` (`\x1b[K`) instead of writing per-cell spaces. Without BCE, blank
 //!   tails are painted as styled space cells — the only correct fallback.
-//! - Own the crossterm `Write` sink. The engine never touches `stdout` except
-//!   through this backend.
+//! - Coalesce an entire synchronized-update frame (or standalone `render` call)
+//!   into a reusable internal buffer and emit it in a single [`Write::write_all`]
+//!   call, avoiding per-cell syscalls and torn PTY writes.
 //! - Manage raw mode and the alternate screen? **No.** This crate deliberately
-//!   does not: the application owns terminal lifecycle (`Backend::writer` exposes
-//!   the sink for exactly that). The engine cannot know whether it is the primary
-//!   or a nested UI, and an RAII guard that guesses wrong is worse than none.
-//!
-//! This is the only place `crossterm` appears on the engine's runtime path; the
-//! grid and diff modules stay pure and testable.
+//!   carries zero OS/TTY dependencies; physical session lifecycle lives in
+//!   `graticule-tty`.
 //!
 //! # Emitter selection
 //!
@@ -29,9 +26,9 @@
 
 use std::io::{self, Write};
 
-use crossterm::{
-    QueueableCommand, cursor,
-    terminal::{self, ClearType, DisableLineWrap, EnableLineWrap},
+use graticule_vt::csi::{
+    self, CLEAR_ALL, CLEAR_UNTIL_NEWLINE, CURSOR_HIDE, CURSOR_SHOW, CursorStyle, DISABLE_LINE_WRAP,
+    ENABLE_LINE_WRAP, RESET_SCROLL_REGION,
 };
 
 use crate::buffer::{Color, Style};
@@ -120,13 +117,19 @@ impl Default for Bce {
     }
 }
 
-/// The crossterm-backed renderer. Owns the output writer, the escape emitter, and
-/// the "what's currently on screen" tracking (cursor position and visibility), so
-/// each draw emits only the delta.
+/// Pure-VT escape renderer. Owns the output writer, the escape emitter, a
+/// reusable frame-coalescing buffer, and the "what's currently on screen"
+/// tracking (cursor position and visibility), so each draw emits only the
+/// minimal delta.
 pub struct Backend<W: Write, E: EscapeEmitter = Driver> {
     out: W,
     bce: Bce,
     emitter: E,
+    /// Reusable frame buffer so an entire synchronized frame (or `render` call)
+    /// lands in one [`Write::write_all`] call without reallocating after warmup.
+    scratch: Vec<u8>,
+    /// True between [`Self::begin_sync_update`] and [`Self::end_sync_update`].
+    in_sync: bool,
     /// Last cursor position we moved to. `None` until the first move, which means
     /// the next draw must always reposition.
     cur: Option<(u16, u16)>,
@@ -178,6 +181,8 @@ impl<W: Write, E: EscapeEmitter> Backend<W, E> {
             out,
             bce,
             emitter,
+            scratch: Vec::with_capacity(8 * 1024),
+            in_sync: false,
             cur: None,
             cursor_visible: None,
         }
@@ -198,25 +203,49 @@ impl<W: Write, E: EscapeEmitter> Backend<W, E> {
         &mut self.emitter
     }
 
-    /// Borrow the underlying writer, for the application to queue raw-mode,
-    /// alternate-screen or mouse setup via crossterm directly.
+    /// Borrow the underlying writer. Any pending buffered bytes are flushed to
+    /// the writer first so caller writes preserve byte ordering.
     pub fn writer(&mut self) -> &mut W {
+        if !self.scratch.is_empty() {
+            let _ = self.flush_scratch();
+        }
         &mut self.out
     }
 
-    /// Open a DEC synchronized-update (mode 2026) envelope: queue the begin marker
-    /// *without* flushing, so it reaches the terminal in the same ordered stream as
-    /// (and ahead of) everything written until the matching
-    /// [`Self::end_sync_update`]. A no-op on terminals without the capability.
+    /// Open a DEC synchronized-update (mode 2026) envelope and begin coalescing
+    /// all writes until the matching [`Self::end_sync_update`].
     pub fn begin_sync_update(&mut self) -> io::Result<()> {
-        self.emitter.begin_sync(&mut self.out)
+        if !self.in_sync {
+            self.in_sync = true;
+            self.emitter.begin_sync(&mut self.scratch)?;
+        }
+        Ok(())
     }
 
     /// Close a synchronized-update envelope opened by
-    /// [`Self::begin_sync_update`], presenting everything written in between
-    /// atomically. Flushes.
+    /// [`Self::begin_sync_update`], emitting the coalesced frame in a single
+    /// [`Write::write_all`] call and flushing the underlying writer.
     pub fn end_sync_update(&mut self) -> io::Result<()> {
-        self.emitter.end_sync(&mut self.out)
+        self.in_sync = false;
+        let _ = self.emitter.end_sync(&mut self.scratch);
+        let write_res = self.flush_scratch();
+        let flush_res = self.out.flush();
+        write_res.and(flush_res)
+    }
+
+    /// Clear the entire visible screen (`CUP 1;1` + `ED 2`), keeping cursor
+    /// tracking in sync.
+    pub fn clear_screen(&mut self) -> io::Result<()> {
+        csi::write_move_to(&mut self.scratch, 0, 0)?;
+        self.scratch.write_all(CLEAR_ALL)?;
+        self.cur = Some((0, 0));
+        self.commit_if_unbatched()
+    }
+
+    /// Set the hardware cursor shape (`DECSCUSR`).
+    pub fn set_cursor_style(&mut self, style: CursorStyle) -> io::Result<()> {
+        self.scratch.write_all(style.as_bytes())?;
+        self.commit_if_unbatched()
     }
 
     /// Apply a diff's draw commands: move the cursor into place, set the style
@@ -237,8 +266,8 @@ impl<W: Write, E: EscapeEmitter> Backend<W, E> {
                     self.scroll_region(*y, *height, *amount, terminal_h, true)?;
                 }
                 Draw::Cells { x, y, style, cells } => {
-                    self.move_to(*x, *y)?;
-                    self.apply_style(*style)?;
+                    self.move_to_buf(*x, *y)?;
+                    self.emitter.apply_style(*style, &mut self.scratch)?;
                     let mut current_x = *x;
                     for (sym, width) in cells {
                         // A symbol may need transliteration for a 7-bit terminal;
@@ -250,11 +279,11 @@ impl<W: Write, E: EscapeEmitter> Backend<W, E> {
                         let reaches_bottom_right = *y == terminal_h.saturating_sub(1)
                             && current_x.saturating_add(width.advance()) >= terminal_w;
                         if reaches_bottom_right {
-                            self.out.queue(DisableLineWrap)?;
+                            self.scratch.write_all(DISABLE_LINE_WRAP)?;
                         }
-                        self.out.queue(crossterm::style::Print(text.as_ref()))?;
+                        self.scratch.write_all(text.as_bytes())?;
                         if reaches_bottom_right {
-                            self.out.queue(EnableLineWrap)?;
+                            self.scratch.write_all(ENABLE_LINE_WRAP)?;
                         }
                         // A wide glyph advances two columns: the trailing
                         // continuation column is implicit and never emitted.
@@ -265,27 +294,26 @@ impl<W: Write, E: EscapeEmitter> Backend<W, E> {
                     }
                 }
                 Draw::ClearEol { x, y, style, width } => {
-                    self.move_to(*x, *y)?;
-                    self.apply_style(*style)?;
+                    self.move_to_buf(*x, *y)?;
+                    self.emitter.apply_style(*style, &mut self.scratch)?;
                     let use_bce = matches!(self.bce, Bce::Yes) && style.bg == Color::Reset;
                     if use_bce {
                         // `\x1b[K` clears from the cursor to end of line with the
                         // currently-set background, which is default here.
-                        self.out.queue(terminal::Clear(ClearType::UntilNewLine))?;
+                        self.scratch.write_all(CLEAR_UNTIL_NEWLINE)?;
                     } else {
                         // No BCE, or a non-default background: paint explicit
-                        // styled spaces to the edge.
+                        // styled spaces to the edge without heap allocation.
                         let reaches_bottom_right = *y == terminal_h.saturating_sub(1)
                             && (*x).saturating_add(*width) >= terminal_w;
                         if reaches_bottom_right {
-                            self.out.queue(DisableLineWrap)?;
+                            self.scratch.write_all(DISABLE_LINE_WRAP)?;
                         }
                         if *width > 0 {
-                            self.out
-                                .queue(crossterm::style::Print(" ".repeat(*width as usize)))?;
+                            csi::write_spaces(&mut self.scratch, *width as usize)?;
                         }
                         if reaches_bottom_right {
-                            self.out.queue(EnableLineWrap)?;
+                            self.scratch.write_all(ENABLE_LINE_WRAP)?;
                         }
                         if let Some((cx, _)) = self.cur.as_mut() {
                             *cx = cx.saturating_add(*width);
@@ -294,6 +322,7 @@ impl<W: Write, E: EscapeEmitter> Backend<W, E> {
                 }
             }
         }
+        self.commit_if_unbatched()?;
         Ok(processed)
     }
 
@@ -321,27 +350,28 @@ impl<W: Write, E: EscapeEmitter> Backend<W, E> {
         if bottom <= top {
             return Ok(());
         }
-        write!(self.out, "\x1b[{};{}r", top, bottom)?;
+        csi::write_scroll_region(&mut self.scratch, top, bottom)?;
         // Home the cursor inside the region first: SU/SD scroll relative to the
         // cursor row on terminals that do not treat the region as absolute.
-        self.out.queue(cursor::MoveTo(0, y))?;
+        csi::write_move_to(&mut self.scratch, 0, y)?;
         if up {
-            write!(self.out, "\x1b[{}S", amount)?;
+            csi::write_scroll_up(&mut self.scratch, amount)?;
         } else {
-            write!(self.out, "\x1b[{}T", amount)?;
+            csi::write_scroll_down(&mut self.scratch, amount)?;
         }
         // Reset the scroll region; the cursor tracking is invalidated below.
-        write!(self.out, "\x1b[r")?;
+        self.scratch.write_all(RESET_SCROLL_REGION)?;
         self.cur = None; // the terminal moved the cursor; forget our tracking
         Ok(())
     }
 
-    /// Move the terminal cursor to `(x, y)` if we are not already there.
-    fn move_to(&mut self, x: u16, y: u16) -> io::Result<()> {
+    /// Move the terminal cursor to `(x, y)` inside `self.scratch` if we are not
+    /// already there.
+    fn move_to_buf(&mut self, x: u16, y: u16) -> io::Result<()> {
         if self.cur == Some((x, y)) {
             return Ok(());
         }
-        self.out.queue(cursor::MoveTo(x, y))?;
+        csi::write_move_to(&mut self.scratch, x, y)?;
         self.cur = Some((x, y));
         Ok(())
     }
@@ -349,10 +379,10 @@ impl<W: Write, E: EscapeEmitter> Backend<W, E> {
     /// Hide the terminal cursor, deduped against the last visibility we set.
     pub fn hide_cursor(&mut self) -> io::Result<()> {
         if self.cursor_visible != Some(false) {
-            self.out.queue(cursor::Hide)?;
+            self.scratch.write_all(CURSOR_HIDE)?;
             self.cursor_visible = Some(false);
         }
-        Ok(())
+        self.commit_if_unbatched()
     }
 
     /// Hide the terminal cursor and park its physical position at `(x, y)`.
@@ -362,17 +392,21 @@ impl<W: Write, E: EscapeEmitter> Backend<W, E> {
     /// "no visible caret" states from inheriting the last diff write position,
     /// which moves during streaming transcript updates.
     pub fn hide_cursor_at(&mut self, x: u16, y: u16) -> io::Result<()> {
-        self.hide_cursor()?;
-        self.move_to(x, y)
+        if self.cursor_visible != Some(false) {
+            self.scratch.write_all(CURSOR_HIDE)?;
+            self.cursor_visible = Some(false);
+        }
+        self.move_to_buf(x, y)?;
+        self.commit_if_unbatched()
     }
 
     /// Show the terminal cursor, deduped against the last visibility we set.
     pub fn show_cursor(&mut self) -> io::Result<()> {
         if self.cursor_visible != Some(true) {
-            self.out.queue(cursor::Show)?;
+            self.scratch.write_all(CURSOR_SHOW)?;
             self.cursor_visible = Some(true);
         }
-        Ok(())
+        self.commit_if_unbatched()
     }
 
     /// Show the terminal cursor at `(x, y)`, keeping the backend's cursor tracker
@@ -383,23 +417,47 @@ impl<W: Write, E: EscapeEmitter> Backend<W, E> {
     /// `MoveTo`, visible as a jumping caret whenever a terminal, multiplexer or
     /// IME does not present synchronized updates as one indivisible operation.
     pub fn show_cursor_at(&mut self, x: u16, y: u16) -> io::Result<()> {
-        self.move_to(x, y)?;
-        self.show_cursor()
+        self.move_to_buf(x, y)?;
+        if self.cursor_visible != Some(true) {
+            self.scratch.write_all(CURSOR_SHOW)?;
+            self.cursor_visible = Some(true);
+        }
+        self.commit_if_unbatched()
     }
 
     /// Apply a style delta using the configured emitter.
     pub fn apply_style(&mut self, want: Style) -> io::Result<()> {
-        self.emitter.apply_style(want, &mut self.out)
+        self.emitter.apply_style(want, &mut self.scratch)?;
+        self.commit_if_unbatched()
     }
 
     /// Reset style and cursor tracking — call after the application performs a
     /// wholesale screen clear or enters the alt screen, where the terminal's state
     /// no longer matches what we track.
     pub fn invalidate(&mut self) -> io::Result<()> {
-        self.emitter.invalidate(&mut self.out)?;
+        self.emitter.invalidate(&mut self.scratch)?;
         self.cur = None;
         self.cursor_visible = None;
-        Ok(())
+        self.commit_if_unbatched()
+    }
+
+    #[inline]
+    fn commit_if_unbatched(&mut self) -> io::Result<()> {
+        if self.in_sync {
+            Ok(())
+        } else {
+            self.flush_scratch()
+        }
+    }
+
+    #[inline]
+    fn flush_scratch(&mut self) -> io::Result<()> {
+        if self.scratch.is_empty() {
+            return Ok(());
+        }
+        let res = self.out.write_all(&self.scratch);
+        self.scratch.clear();
+        res
     }
 }
 
@@ -413,7 +471,6 @@ mod tests {
     /// Capture backend: accumulates the raw bytes emitted so tests can assert
     /// the exact escape sequence without a real terminal.
     fn render_to_string(cmd: &DrawCmd, bce: Bce) -> String {
-        crossterm::style::force_color_output(true);
         let mut buf = Vec::new();
         {
             let mut be = Backend::new(&mut buf)
@@ -424,6 +481,67 @@ mod tests {
         String::from_utf8(buf).unwrap()
     }
 
+    /// Counts how many `write()` calls hit the underlying sink.
+    #[derive(Default)]
+    struct WriteCountingSink {
+        bytes: Vec<u8>,
+        write_calls: usize,
+        flush_calls: usize,
+    }
+
+    impl Write for WriteCountingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_calls += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_calls += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn synchronized_frame_coalesces_into_a_single_write_call() {
+        let mut sink = WriteCountingSink::default();
+        let cmd = DrawCmd {
+            w: 10,
+            h: 2,
+            draws: vec![
+                Draw::Cells {
+                    x: 0,
+                    y: 0,
+                    style: Style::default().fg(Color::Rgb(10, 20, 30)),
+                    cells: vec![
+                        ("H".into(), CellWidth::Narrow),
+                        ("i".into(), CellWidth::Narrow),
+                    ],
+                },
+                Draw::ClearEol {
+                    x: 2,
+                    y: 0,
+                    style: Style::RESET,
+                    width: 8,
+                },
+            ],
+        };
+        {
+            let mut be = Backend::new(&mut sink)
+                .with_bce(Bce::Yes)
+                .with_profile(TerminalProfile::direct_color());
+            be.begin_sync_update().unwrap();
+            be.hide_cursor().unwrap();
+            be.render(&cmd).unwrap();
+            be.show_cursor_at(2, 0).unwrap();
+            be.end_sync_update().unwrap();
+        }
+        assert_eq!(sink.write_calls, 1, "entire frame must land in one write");
+        assert_eq!(sink.flush_calls, 1, "entire frame must flush once");
+        let s = String::from_utf8(sink.bytes).unwrap();
+        assert!(s.starts_with("\x1b[?2026h"));
+        assert!(s.ends_with("\x1b[?2026l"));
+    }
+
     #[test]
     fn empty_diff_emits_nothing() {
         let cmd = DrawCmd::default();
@@ -432,7 +550,6 @@ mod tests {
 
     #[test]
     fn single_run_emits_move_sgr_and_text() {
-        crossterm::style::force_color_output(true);
         let mut back = CellGrid::new(4, 1);
         let mut damage = Damage::new(1);
         back.put(
@@ -446,14 +563,12 @@ mod tests {
         let front = CellGrid::new(4, 1);
         let cmd = crate::render::diff::diff(&back, &damage, &front);
         let s = render_to_string(&cmd, Bce::Yes);
-        // crossterm emits RGB foreground as `\x1b[38;2;r;g;bm`.
         assert!(s.contains("\x1b[38;2;1;2;3m"), "fg SGR present: {s:?}");
         assert!(s.contains("ab"));
     }
 
     #[test]
     fn repeated_style_emits_no_duplicate_sgr() {
-        crossterm::style::force_color_output(true);
         // Two adjacent runs with the same style should emit the SGR once.
         let mut back = CellGrid::new(4, 1);
         let mut damage = Damage::new(1);
@@ -470,7 +585,6 @@ mod tests {
 
     #[test]
     fn cursor_positioning_keeps_next_frame_draws_honest() {
-        crossterm::style::force_color_output(true);
         let first = DrawCmd {
             w: 4,
             h: 3,
@@ -562,22 +676,16 @@ mod tests {
 
     #[test]
     fn repeated_hide_does_not_reamit_visibility_sequence() {
-        // Regression for the post-incremental-sync flicker: a redraw that
-        // leaves the cursor hidden must not re-queue `?25l` every frame just
-        // because `Terminal::draw` parks the hidden caret each tick.
         let mut buf = Vec::new();
         {
             let mut be = Backend::new(&mut buf).with_bce(Bce::Yes);
             be.hide_cursor_at(3, 2).unwrap();
-            // Second frame, different parking coordinate — visibility is
-            // unchanged, so only the move may re-emit, never `?25l`.
             be.hide_cursor_at(4, 5).unwrap();
         }
 
         let s = String::from_utf8(buf).unwrap();
         let hide_count = s.matches("\x1b[?25l").count();
         assert_eq!(hide_count, 1, "hide emitted once, got: {s:?}");
-        // Position tracking is independent and must still move to the new park.
         assert!(
             s.contains("\x1b[6;5H"),
             "second park must move to row 6 col 5: {s:?}"
@@ -586,9 +694,6 @@ mod tests {
 
     #[test]
     fn show_hide_toggle_emits_only_on_transition() {
-        // Visibility dedup must emit on a real state change and stay silent
-        // otherwise — including the very first call (cursor_visible starts
-        // unknown, so it always fires, exactly like `cur` for position).
         let mut buf = Vec::new();
         {
             let mut be = Backend::new(&mut buf).with_bce(Bce::Yes);
@@ -614,9 +719,6 @@ mod tests {
 
     #[test]
     fn invalidate_forces_next_visibility_to_reemit() {
-        // After a wholesale screen reset (alt-screen / resize), the terminal's
-        // real cursor visibility is outside our control, so `invalidate` must
-        // forget our tracked state and force the next hide/show to re-emit.
         let mut buf = Vec::new();
         {
             let mut be = Backend::new(&mut buf).with_bce(Bce::Yes);
@@ -637,7 +739,6 @@ mod tests {
 
     #[test]
     fn non_bce_clear_eol_paints_bottom_right_under_line_wrap_guard() {
-        crossterm::style::force_color_output(true);
         let cmd = DrawCmd {
             w: 4,
             h: 2,
@@ -663,7 +764,6 @@ mod tests {
 
     #[test]
     fn scroll_up_emits_scroll_region_and_su() {
-        crossterm::style::force_color_output(true);
         let cmd = DrawCmd {
             w: 20,
             h: 10,
@@ -674,7 +774,6 @@ mod tests {
             }],
         };
         let s = render_to_string(&cmd, Bce::Yes);
-        // DECSTBM for rows 2..=9 (1-based), home cursor inside, SU by 2, reset.
         assert!(s.contains("\x1b[2;9r"), "scroll region set: {s:?}");
         assert!(s.contains("\x1b[2;1H"), "cursor homed inside region: {s:?}");
         assert!(s.contains("\x1b[2S"), "scroll-up issued: {s:?}");
@@ -683,7 +782,6 @@ mod tests {
 
     #[test]
     fn scroll_down_emits_scroll_region_and_sd() {
-        crossterm::style::force_color_output(true);
         let cmd = DrawCmd {
             w: 20,
             h: 10,
@@ -711,15 +809,11 @@ mod tests {
 
     #[test]
     fn bce_override_env_wins() {
-        // Override forces on/off regardless of TERM.
         assert_eq!(Bce::for_term("xterm-256color", Some("0")), Bce::No);
         assert_eq!(Bce::for_term("dumb", Some("1")), Bce::Yes);
-        // Garbage override falls back to the TERM-based decision.
         assert_eq!(Bce::for_term("xterm-256color", Some("maybe")), Bce::Yes);
     }
-    /// The out-of-band sync-update primitives must bracket atomically: begin
-    /// queues without flushing, end queues + flushes, and the emitted bytes
-    /// are exactly `?2026h` … `?2026l`.
+
     #[test]
     fn sync_update_envelope_brackets_out_of_band_writes() {
         let mut buf: Vec<u8> = Vec::new();
@@ -734,7 +828,6 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.starts_with("\x1b[?2026h"), "envelope opens first: {s:?}");
         assert!(s.ends_with("\x1b[?2026l"), "envelope closes last: {s:?}");
-        // `MoveTo(x=5, y=7)` is 1-based in the escape: row 8, column 6.
         assert!(
             s.contains("\x1b[?25h") && s.contains("\x1b[8;6H"),
             "the out-of-band caret write sits inside the envelope: {s:?}"
@@ -745,10 +838,6 @@ mod tests {
         );
     }
 
-    /// Repeated envelopes must not re-open while one is conceptually live;
-    /// more importantly the *ordering* contract: every begin is followed by
-    /// its end before the next begin (a begin/begin/end sequence would
-    /// suspend updates past the intended window).
     #[test]
     fn sync_update_envelopes_never_nest() {
         let mut buf: Vec<u8> = Vec::new();
@@ -767,9 +856,6 @@ mod tests {
         let ends = s.matches("\x1b[?2026l").count();
         assert_eq!(begins, 3, "one begin per envelope: {s:?}");
         assert_eq!(ends, 3, "one end per envelope: {s:?}");
-        // No begin appears between another begin and its end, and none is
-        // left open: scan the marker occurrences in byte order and track
-        // depth.
         let mut depth = 0i32;
         let mut pos = 0usize;
         let mut properly_nested = true;
@@ -819,7 +905,6 @@ mod tests {
             be.render(&cmd).unwrap();
         }
         let s = String::from_utf8(buf).unwrap();
-        // Must contain NO TrueColor or ANSI color SGR codes
         assert!(
             !s.contains("\x1b[38;"),
             "no 38; color codes in monochrome: {s:?}"
@@ -832,7 +917,6 @@ mod tests {
             !s.contains("\x1b[31m"),
             "no ANSI color codes in monochrome: {s:?}"
         );
-        // Highlighted cell with bg tint should emit SGR 7 (reverse video)
         assert!(
             s.contains("\x1b[7m"),
             "highlighted cell uses reverse video: {s:?}"

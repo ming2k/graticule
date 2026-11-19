@@ -1,24 +1,36 @@
 //! Opt-in physical terminal session lifecycle (raw mode, alternate screen,
-//! mouse tracking, bracketed paste, and keyboard enhancement).
+//! mouse tracking, bracketed paste, focus reporting, cursor style, and
+//! keyboard enhancement).
 //!
+//! Pure-native implementation using `graticule-vt` escape sequences and direct
+//! OS raw-mode syscalls (`termios` on Unix, Win32 Console API on Windows).
 //! Restores terminal state idempotently on [`Drop`] and via [`restore_global`]
 //! so panic hooks and signal guards return the terminal to a clean cooked mode.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{cursor, execute};
+use graticule_vt::csi::{
+    CURSOR_HIDE, CURSOR_SHOW, CursorStyle, DISABLE_BRACKETED_PASTE, DISABLE_FOCUS_EVENTS,
+    ENABLE_BRACKETED_PASTE, ENABLE_FOCUS_EVENTS, ENTER_ALTERNATE_SCREEN, LEAVE_ALTERNATE_SCREEN,
+    POP_KITTY_KEYBOARD, PUSH_KITTY_DISAMBIGUATE,
+};
+use graticule_vt::mouse::MouseMode;
+use graticule_vt::osc;
+use graticule_vt::sgr::SGR_RESET;
 
-use crate::mouse::MouseMode;
 use crate::reader::ProbeHandle;
+use crate::sys;
 
 static RAW_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALT_SCREEN_ENABLED: AtomicBool = AtomicBool::new(false);
 static BRACKETED_PASTE_ENABLED: AtomicBool = AtomicBool::new(false);
+static FOCUS_EVENTS_ENABLED: AtomicBool = AtomicBool::new(false);
+static CURSOR_STYLE_MODIFIED: AtomicBool = AtomicBool::new(false);
 static KEYBOARD_ENHANCEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
-static ACTIVE_MOUSE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static ACTIVE_MOUSE_MODE: AtomicU8 = AtomicU8::new(0);
 
 const MOUSE_NONE: u8 = 0;
 const MOUSE_BUTTON: u8 = 1;
@@ -53,6 +65,10 @@ pub struct SessionConfig {
     pub mouse_mode: MouseMode,
     /// Enable bracketed paste (`?2004h`) on start.
     pub bracketed_paste: bool,
+    /// Enable terminal focus reporting (`?1004h`) on start.
+    pub focus_events: bool,
+    /// Optional hardware cursor shape (`DECSCUSR`) to apply while active.
+    pub cursor_style: Option<CursorStyle>,
 }
 
 impl Default for SessionConfig {
@@ -63,6 +79,8 @@ impl Default for SessionConfig {
             hide_cursor: true,
             mouse_mode: MouseMode::Button,
             bracketed_paste: true,
+            focus_events: false,
+            cursor_style: None,
         }
     }
 }
@@ -80,38 +98,56 @@ pub struct TerminalSession {
 impl TerminalSession {
     /// Enter interactive terminal modes according to `config`.
     ///
-    /// Never blocks on terminal queries.
+    /// Coalesces all mode-enable escape sequences into a single atomic write
+    /// and never blocks on terminal queries.
     pub fn enter(config: SessionConfig) -> io::Result<Self> {
         if config.raw_mode {
-            terminal::enable_raw_mode()?;
+            sys::enable_raw_mode()?;
             RAW_MODE_ENABLED.store(true, Ordering::Release);
         }
 
-        let mut stdout = io::stdout();
+        let mut seq = Vec::with_capacity(96);
         if config.alternate_screen {
-            if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+            seq.extend_from_slice(ENTER_ALTERNATE_SCREEN);
+        }
+        if config.hide_cursor {
+            seq.extend_from_slice(CURSOR_HIDE);
+        }
+        if let Some(style) = config.cursor_style {
+            seq.extend_from_slice(style.as_bytes());
+        }
+        if config.mouse_mode != MouseMode::None {
+            seq.extend_from_slice(config.mouse_mode.enable_bytes().as_bytes());
+        }
+        if config.bracketed_paste {
+            seq.extend_from_slice(ENABLE_BRACKETED_PASTE);
+        }
+        if config.focus_events {
+            seq.extend_from_slice(ENABLE_FOCUS_EVENTS);
+        }
+
+        if !seq.is_empty() {
+            let mut stdout = io::stdout();
+            if let Err(err) = stdout.write_all(&seq).and_then(|()| stdout.flush()) {
                 restore_global();
                 return Err(err);
             }
+        }
+
+        if config.alternate_screen {
             ALT_SCREEN_ENABLED.store(true, Ordering::Release);
         }
-
-        if config.hide_cursor {
-            let _ = execute!(stdout, cursor::Hide);
+        if config.cursor_style.is_some() {
+            CURSOR_STYLE_MODIFIED.store(true, Ordering::Release);
         }
-
         if config.mouse_mode != MouseMode::None {
-            let bytes = config.mouse_mode.enable_bytes();
-            if stdout.write_all(bytes.as_bytes()).is_ok() && stdout.flush().is_ok() {
-                ACTIVE_MOUSE_MODE.store(encode_mouse(config.mouse_mode), Ordering::Release);
-            }
+            ACTIVE_MOUSE_MODE.store(encode_mouse(config.mouse_mode), Ordering::Release);
         }
-
-        if config.bracketed_paste
-            && stdout.write_all(b"\x1b[?2004h").is_ok()
-            && stdout.flush().is_ok()
-        {
+        if config.bracketed_paste {
             BRACKETED_PASTE_ENABLED.store(true, Ordering::Release);
+        }
+        if config.focus_events {
+            FOCUS_EVENTS_ENABLED.store(true, Ordering::Release);
         }
 
         Ok(Self {
@@ -132,17 +168,39 @@ impl TerminalSession {
 
     /// Update the active mouse tracking mode at runtime.
     pub fn set_mouse_mode(&mut self, mode: MouseMode) -> io::Result<()> {
-        let mut stdout = io::stdout();
         let prev = decode_mouse(ACTIVE_MOUSE_MODE.swap(encode_mouse(mode), Ordering::AcqRel));
+        let mut seq = Vec::with_capacity(48);
         if prev != MouseMode::None {
-            stdout.write_all(prev.disable_bytes().as_bytes())?;
+            seq.extend_from_slice(prev.disable_bytes().as_bytes());
         }
         if mode != MouseMode::None {
-            stdout.write_all(mode.enable_bytes().as_bytes())?;
+            seq.extend_from_slice(mode.enable_bytes().as_bytes());
         }
-        stdout.flush()?;
+        if !seq.is_empty() {
+            let mut stdout = io::stdout();
+            stdout.write_all(&seq)?;
+            stdout.flush()?;
+        }
         self.config.mouse_mode = mode;
         Ok(())
+    }
+
+    /// Update the hardware cursor shape (`DECSCUSR`) at runtime and mark it for
+    /// restoration to [`CursorStyle::DefaultUserShape`] on exit.
+    pub fn set_cursor_style(&mut self, style: CursorStyle) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        stdout.write_all(style.as_bytes())?;
+        stdout.flush()?;
+        CURSOR_STYLE_MODIFIED.store(true, Ordering::Release);
+        self.config.cursor_style = Some(style);
+        Ok(())
+    }
+
+    /// Set the terminal window title via sanitized OSC 2 (`\x1b]2;{title}\x07`).
+    pub fn set_window_title(&self, title: &str) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        osc::write_window_title(&mut stdout, title)?;
+        stdout.flush()
     }
 
     /// Probe and push Kitty `DISAMBIGUATE_ESCAPE_CODES` (`\x1b[>1u`) off the
@@ -174,7 +232,7 @@ impl Drop for TerminalSession {
 /// for cleanup on restore.
 pub fn push_disambiguate_escape_codes() -> bool {
     let mut stdout = io::stdout();
-    if stdout.write_all(b"\x1b[>1u").is_ok() && stdout.flush().is_ok() {
+    if stdout.write_all(PUSH_KITTY_DISAMBIGUATE).is_ok() && stdout.flush().is_ok() {
         KEYBOARD_ENHANCEMENT_ENABLED.store(true, Ordering::Release);
         true
     } else {
@@ -184,31 +242,48 @@ pub fn push_disambiguate_escape_codes() -> bool {
 
 /// Idempotent global terminal restore safe to invoke from panic hooks and
 /// signal handlers.
+///
+/// Coalesces all teardown escape sequences (Kitty pop, focus off, bracketed
+/// paste off, mouse off, cursor shape reset, SGR reset, leave alternate screen,
+/// show cursor) into a single write before restoring cooked mode.
 pub fn restore_global() {
-    let mut stdout = io::stdout();
+    let mut seq = Vec::with_capacity(96);
 
     if KEYBOARD_ENHANCEMENT_ENABLED.swap(false, Ordering::AcqRel) {
-        let _ = stdout.write_all(b"\x1b[<u");
+        seq.extend_from_slice(POP_KITTY_KEYBOARD);
+    }
+
+    if FOCUS_EVENTS_ENABLED.swap(false, Ordering::AcqRel) {
+        seq.extend_from_slice(DISABLE_FOCUS_EVENTS);
     }
 
     if BRACKETED_PASTE_ENABLED.swap(false, Ordering::AcqRel) {
-        let _ = stdout.write_all(b"\x1b[?2004l");
+        seq.extend_from_slice(DISABLE_BRACKETED_PASTE);
     }
 
     let mouse = decode_mouse(ACTIVE_MOUSE_MODE.swap(MOUSE_NONE, Ordering::AcqRel));
     if mouse != MouseMode::None {
-        let _ = stdout.write_all(mouse.disable_bytes().as_bytes());
+        seq.extend_from_slice(mouse.disable_bytes().as_bytes());
     }
+
+    if CURSOR_STYLE_MODIFIED.swap(false, Ordering::AcqRel) {
+        seq.extend_from_slice(CursorStyle::DefaultUserShape.as_bytes());
+    }
+
+    seq.extend_from_slice(SGR_RESET);
 
     if ALT_SCREEN_ENABLED.swap(false, Ordering::AcqRel) {
-        let _ = execute!(stdout, LeaveAlternateScreen);
+        seq.extend_from_slice(LEAVE_ALTERNATE_SCREEN);
     }
 
-    let _ = execute!(stdout, cursor::Show);
+    seq.extend_from_slice(CURSOR_SHOW);
+
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(&seq);
     let _ = stdout.flush();
 
     if RAW_MODE_ENABLED.swap(false, Ordering::AcqRel) {
-        let _ = terminal::disable_raw_mode();
+        let _ = sys::disable_raw_mode();
     }
 }
 
@@ -225,5 +300,31 @@ pub fn rearm_active_mouse() {
 
 /// Query the current terminal size in `(columns, rows)`.
 pub fn terminal_size() -> io::Result<(u16, u16)> {
-    crate::sys::terminal_size()
+    sys::terminal_size()
+}
+
+/// Whether the process is connected to an interactive terminal.
+pub fn is_tty() -> bool {
+    sys::is_tty()
+}
+
+/// Whether Graticule currently holds the terminal in raw mode.
+pub fn is_raw_mode_enabled() -> bool {
+    sys::is_raw_mode_enabled()
+}
+
+/// Install a process-wide panic hook that restores the terminal via
+/// [`restore_global`] before delegating to the previously installed panic hook.
+///
+/// Idempotent: calling more than once is a no-op so hooks never chain
+/// recursively.
+pub fn install_panic_hook() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_global();
+            prev(info);
+        }));
+    });
 }

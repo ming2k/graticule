@@ -12,7 +12,7 @@ categories = ["command-line-interface", "graphics"]
 
 [dependencies]
 bitflags = { workspace = true }
-crossterm = { workspace = true, features = ["windows"] }
+graticule-vt = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 

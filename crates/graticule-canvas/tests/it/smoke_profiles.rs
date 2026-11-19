@@ -27,7 +27,6 @@ use graticule_canvas::{
 /// background highlight and an italic run, so every capability a profile can
 /// claim shows up in the bytes.
 fn render_test_frame(profile: &TerminalProfile) -> Vec<u8> {
-    crossterm::style::force_color_output(true);
     let mut sink = Vec::new();
     let cmd = DrawCmd {
         w: 80,
@@ -100,10 +99,13 @@ fn smoke_scenario_1_direct_color_truecolor() {
         "must close mode 2026: {output:?}"
     );
     // 2. 24-bit color.
-    assert!(output.contains("\x1b[38;2;"), "fg RGB: {output:?}");
-    assert!(output.contains("\x1b[48;2;"), "bg RGB: {output:?}");
+    assert!(output.contains("38;2;"), "fg RGB: {output:?}");
+    assert!(output.contains("48;2;"), "bg RGB: {output:?}");
     // 3. Italic is emitted directly, because the profile supports it.
-    assert!(output.contains("\x1b[3m"), "SGR 3 italic: {output:?}");
+    assert!(
+        output.contains("\x1b[3m") || output.contains(";3m") || output.contains(";3;"),
+        "SGR 3 italic: {output:?}"
+    );
     // 4. The box-drawing glyph survives untransliterated.
     assert!(output.contains('┃'), "UTF-8 glyph intact: {output:?}");
 }

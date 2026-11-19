@@ -1,0 +1,17 @@
+[package]
+name = "graticule-vt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Pure-Rust VT/ECMA-48/DEC/Kitty wire protocol: zero-allocation escape encoding and incremental input parsing"
+keywords = ["tui", "terminal", "vt", "ansi", "ecma48"]
+categories = ["command-line-interface", "parsing"]
+
+[dependencies]
+bitflags = { workspace = true }
+
+[lints]
+workspace = true
